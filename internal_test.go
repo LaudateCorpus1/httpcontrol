@@ -2,14 +2,11 @@ package httpcontrol
 
 import (
 	"errors"
-	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"testing"
-	"time"
 
-	"github.com/facebookgo/ensure"
+	"github.com/onsi/gomega"
 )
 
 type mockNetError struct {
@@ -22,6 +19,8 @@ func (t mockNetError) Temporary() bool { return t.temporary }
 func (t mockNetError) Timeout() bool   { return t.timeout }
 
 func TestShouldRetry(t *testing.T) {
+	gomega.RegisterTestingT(t)
+
 	r := Transport{RetryAfterTimeout: true}
 	cases := []error{
 		mockNetError{temporary: true},
@@ -33,25 +32,14 @@ func TestShouldRetry(t *testing.T) {
 	for _, s := range knownFailureSuffixes {
 		cases = append(cases, errors.New(s))
 	}
-	for i, err := range cases {
-		ensure.True(t, r.shouldRetryError(err), fmt.Sprintf("case %d", i))
+	for _, err := range cases {
+		gomega.Expect(r.shouldRetryError(err)).To(gomega.BeTrue())
 	}
 }
 
 func TestShouldNotRetryRandomError(t *testing.T) {
-	var r Transport
-	ensure.False(t, r.shouldRetryError(errors.New("")))
-}
+	gomega.RegisterTestingT(t)
 
-func TestCancelRequest(t *testing.T) {
-	var called bool
-	timer := time.AfterFunc(time.Hour, func() { called = true })
 	var r Transport
-	r.CancelRequest(&http.Request{
-		Body: &bodyCloser{
-			timer: timer,
-		},
-	})
-	ensure.False(t, called)
-	ensure.False(t, timer.Stop())
+	gomega.Expect(r.shouldRetryError(errors.New(""))).To(gomega.BeFalse())
 }

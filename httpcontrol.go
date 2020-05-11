@@ -6,18 +6,16 @@
 package httpcontrol
 
 import (
-	"bytes"
-	"crypto/tls"
-	"flag"
-	"fmt"
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Stats for a RoundTrip.
@@ -51,14 +49,18 @@ type Stats struct {
 
 // A human readable representation often useful for debugging.
 func (s *Stats) String() string {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "%s %s", s.Request.Method, s.Request.URL)
+	var b strings.Builder
+
+	b.WriteString(s.Request.Method)
+	b.WriteString(" ")
+	b.WriteString(s.Request.URL.String())
 
 	if s.Response != nil {
-		fmt.Fprintf(&buf, " got response with status %s", s.Response.Status)
+		b.WriteString(" got response with status ")
+		b.WriteString(s.Response.Status)
 	}
 
-	return buf.String()
+	return b.String()
 }
 
 // Transport is an implementation of RoundTripper that supports http, https,
@@ -66,67 +68,38 @@ func (s *Stats) String() string {
 // cache connections for future re-use, provides various timeouts, retry logic
 // and the ability to track request statistics.
 type Transport struct {
+	http.Transport
 
-	// Proxy specifies a function to return a proxy for a given
-	// *http.Request. If the function returns a non-nil error, the
-	// request is aborted with the provided error.
-	// If Proxy is nil or returns a nil *url.URL, no proxy is used.
-	Proxy func(*http.Request) (*url.URL, error)
-
-	// TLSClientConfig specifies the TLS configuration to use with
-	// tls.Client. If nil, the default configuration is used.
-	TLSClientConfig *tls.Config
-
-	// DisableKeepAlives, if true, prevents re-use of TCP connections
-	// between different HTTP requests.
-	DisableKeepAlives bool
-
-	// DisableCompression, if true, prevents the Transport from
-	// requesting compression with an "Accept-Encoding: gzip"
-	// request header when the Request contains no existing
-	// Accept-Encoding value. If the Transport requests gzip on
-	// its own and gets a gzipped response, it's transparently
-	// decoded in the Response.Body. However, if the user
-	// explicitly requested gzip it is not automatically
-	// uncompressed.
-	DisableCompression bool
-
-	// MaxIdleConnsPerHost, if non-zero, controls the maximum idle
-	// (keep-alive) to keep per-host.  If zero,
-	// http.DefaultMaxIdleConnsPerHost is used.
-	MaxIdleConnsPerHost int
-
-	// Dial connects to the address on the named network.
-	//
-	// See func Dial for a description of the network and address
-	// parameters.
-	Dial func(network, address string) (net.Conn, error)
-
-	// Timeout is the maximum amount of time a dial will wait for
-	// a connect to complete.
+	// DialTimeout is the maximum amount of time a dial will wait for
+	// a connect to complete. If Deadline is also set, it may fail
+	// earlier.
 	//
 	// The default is no timeout.
+	//
+	// When using TCP and dialing a host name with multiple IP
+	// addresses, the timeout may be divided between them.
 	//
 	// With or without a timeout, the operating system may impose
 	// its own earlier timeout. For instance, TCP timeouts are
 	// often around 3 minutes.
 	DialTimeout time.Duration
 
-	// DialKeepAlive specifies the keep-alive period for an active
-	// network connection.
-	// If zero, keep-alives are not enabled. Network protocols
-	// that do not support keep-alives ignore this field.
+	// DialKeepAlive specifies the interval between keep-alive
+	// probes for an active network connection.
+	// If zero, keep-alive probes are sent with a default value
+	// (currently 15 seconds), if supported by the protocol and operating
+	// system. Network protocols or operating systems that do
+	// not support keep-alives ignore this field.
+	// If negative, keep-alive probes are disabled.
 	DialKeepAlive time.Duration
-
-	// ResponseHeaderTimeout, if non-zero, specifies the amount of
-	// time to wait for a server's response headers after fully
-	// writing the request (including its body, if any). This
-	// time does not include the time to read the response body.
-	ResponseHeaderTimeout time.Duration
 
 	// RequestTimeout, if non-zero, specifies the amount of time for the entire
 	// request. This includes dialing (if necessary), the response header as well
 	// as the entire body.
+	//
+	// Deprecated: Use Request.WithContext to create a request with a
+	// cancelable context instead. RequestTimeout cannot cancel HTTP/2
+	// requests.
 	RequestTimeout time.Duration
 
 	// RetryAfterTimeout, if true, will enable retries for a number of failures
@@ -148,13 +121,15 @@ type Transport struct {
 	Stats func(*Stats)
 
 	startOnce sync.Once
-	transport *http.Transport
+
+	requestCancelMap   map[*http.Request]context.CancelFunc
+	requestCancelMutex sync.Mutex
 }
 
 var knownFailureSuffixes = []string{
-	syscall.ECONNREFUSED.Error(),
-	syscall.ECONNRESET.Error(),
-	syscall.ETIMEDOUT.Error(),
+	unix.ECONNREFUSED.Error(),
+	unix.ECONNRESET.Error(),
+	unix.ETIMEDOUT.Error(),
 	"no such host",
 	"remote error: handshake failure",
 	io.ErrUnexpectedEOF.Error(),
@@ -175,7 +150,8 @@ func (t *Transport) shouldRetryError(err error) bool {
 
 		// http://stackoverflow.com/questions/23494950/specifically-check-for-timeout-error
 		if urlerr, ok := err.(*url.Error); ok {
-			if neturlerr, ok := urlerr.Err.(net.Error); ok && neturlerr.Timeout() {
+			var neturlerr net.Error
+			if neturlerr, ok = urlerr.Err.(net.Error); ok && neturlerr.Timeout() {
 				return true
 			}
 		}
@@ -202,53 +178,56 @@ func (t *Transport) shouldRetryError(err error) bool {
 
 // Start the Transport.
 func (t *Transport) start() {
-	if t.Dial == nil {
-		dialer := &net.Dialer{
-			Timeout:   t.DialTimeout,
-			KeepAlive: t.DialKeepAlive,
+	if (t.DialContext == nil) && (t.Dial == nil) {
+		if (t.DialTimeout != 0) || (t.DialKeepAlive != 0) {
+			dialer := &net.Dialer{
+				Timeout:   t.DialTimeout,
+				KeepAlive: t.DialKeepAlive,
+			}
+			t.DialContext = dialer.DialContext
 		}
-		t.Dial = dialer.Dial
 	}
-	t.transport = &http.Transport{
-		Dial:                  t.Dial,
-		Proxy:                 t.Proxy,
-		TLSClientConfig:       t.TLSClientConfig,
-		DisableKeepAlives:     t.DisableKeepAlives,
-		DisableCompression:    t.DisableCompression,
-		MaxIdleConnsPerHost:   t.MaxIdleConnsPerHost,
-		ResponseHeaderTimeout: t.ResponseHeaderTimeout,
+
+	if t.requestCancelMap == nil {
+		t.requestCancelMap = make(map[*http.Request]context.CancelFunc)
 	}
 }
 
 // CloseIdleConnections closes the idle connections.
 func (t *Transport) CloseIdleConnections() {
 	t.startOnce.Do(t.start)
-	t.transport.CloseIdleConnections()
+	t.Transport.CloseIdleConnections()
 }
 
 // CancelRequest cancels an in-flight request by closing its connection.
+// CancelRequest should only be called after RoundTrip has returned.
+//
+// Deprecated: Use Request.WithContext to create a request with a
+// cancelable context instead. CancelRequest cannot cancel HTTP/2
+// requests.
 func (t *Transport) CancelRequest(req *http.Request) {
 	t.startOnce.Do(t.start)
-	if bc, ok := req.Body.(*bodyCloser); ok {
-		bc.timer.Stop()
+
+	if t.RequestTimeout != 0 {
+		t.requestCancelMutex.Lock()
+		cancelFunc, ok := t.requestCancelMap[req]
+		if ok {
+			delete(t.requestCancelMap, req)
+		}
+		t.requestCancelMutex.Unlock()
+		if cancelFunc != nil {
+			cancelFunc()
+		}
+	} else {
+		t.Transport.CancelRequest(req)
 	}
-	t.transport.CancelRequest(req)
 }
 
 func (t *Transport) tries(req *http.Request, try uint) (*http.Response, error) {
 	startTime := time.Now()
-	var timer *time.Timer
-	if t.RequestTimeout != 0 {
-		timer = time.AfterFunc(t.RequestTimeout, func() {
-			t.CancelRequest(req)
-		})
-	}
-	res, err := t.transport.RoundTrip(req)
+	res, err := t.Transport.RoundTrip(req)
 	headerTime := time.Now()
 	if err != nil {
-		if timer != nil {
-			timer.Stop()
-		}
 		var stats *Stats
 		if t.Stats != nil {
 			stats = &Stats{
@@ -260,8 +239,8 @@ func (t *Transport) tries(req *http.Request, try uint) (*http.Response, error) {
 			stats.Retry.Count = try
 		}
 
-		if try < t.MaxTries && req.Method == "GET" && t.shouldRetryError(err) {
-			if t.Stats != nil {
+		if try < t.MaxTries && req.Method == http.MethodGet && t.shouldRetryError(err) {
+			if stats != nil {
 				stats.Retry.Pending = true
 				t.Stats(stats)
 			}
@@ -276,7 +255,6 @@ func (t *Transport) tries(req *http.Request, try uint) (*http.Response, error) {
 
 	res.Body = &bodyCloser{
 		ReadCloser: res.Body,
-		timer:      timer,
 		res:        res,
 		transport:  t,
 		startTime:  startTime,
@@ -288,22 +266,35 @@ func (t *Transport) tries(req *http.Request, try uint) (*http.Response, error) {
 // RoundTrip implements the RoundTripper interface.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.startOnce.Do(t.start)
+	if t.RequestTimeout != 0 {
+		origReq := req
+
+		ctx, cancelFunc := context.WithTimeout(req.Context(), t.RequestTimeout)
+		t.requestCancelMutex.Lock()
+		t.requestCancelMap[req] = cancelFunc
+		t.requestCancelMutex.Unlock()
+
+		defer func() {
+			t.requestCancelMutex.Lock()
+			delete(t.requestCancelMap, origReq)
+			t.requestCancelMutex.Unlock()
+		}()
+
+		req = req.WithContext(ctx)
+	}
 	return t.tries(req, 0)
 }
 
 type bodyCloser struct {
 	io.ReadCloser
-	timer      *time.Timer
 	res        *http.Response
 	transport  *Transport
 	startTime  time.Time
 	headerTime time.Time
 }
 
+// Close implements the Closer interface
 func (b *bodyCloser) Close() error {
-	if b.timer != nil {
-		b.timer.Stop()
-	}
 	err := b.ReadCloser.Close()
 	closeTime := time.Now()
 	if b.transport.Stats != nil {
@@ -316,64 +307,4 @@ func (b *bodyCloser) Close() error {
 		b.transport.Stats(stats)
 	}
 	return err
-}
-
-// TransportFlag - A Flag configured Transport instance.
-func TransportFlag(name string) *Transport {
-	t := &Transport{TLSClientConfig: &tls.Config{}}
-	flag.BoolVar(
-		&t.TLSClientConfig.InsecureSkipVerify,
-		name+".insecure-tls",
-		false,
-		name+" skip tls certificate verification",
-	)
-	flag.BoolVar(
-		&t.DisableKeepAlives,
-		name+".disable-keepalive",
-		false,
-		name+" disable keep-alives",
-	)
-	flag.BoolVar(
-		&t.DisableCompression,
-		name+".disable-compression",
-		false,
-		name+" disable compression",
-	)
-	flag.IntVar(
-		&t.MaxIdleConnsPerHost,
-		name+".max-idle-conns-per-host",
-		http.DefaultMaxIdleConnsPerHost,
-		name+" max idle connections per host",
-	)
-	flag.DurationVar(
-		&t.DialTimeout,
-		name+".dial-timeout",
-		2*time.Second,
-		name+" dial timeout",
-	)
-	flag.DurationVar(
-		&t.DialKeepAlive,
-		name+".dial-keepalive",
-		0,
-		name+" dial keepalive connection",
-	)
-	flag.DurationVar(
-		&t.ResponseHeaderTimeout,
-		name+".response-header-timeout",
-		3*time.Second,
-		name+" response header timeout",
-	)
-	flag.DurationVar(
-		&t.RequestTimeout,
-		name+".request-timeout",
-		30*time.Second,
-		name+" request timeout",
-	)
-	flag.UintVar(
-		&t.MaxTries,
-		name+".max-tries",
-		0,
-		name+" max retries for known safe failures",
-	)
-	return t
 }

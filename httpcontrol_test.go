@@ -10,13 +10,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/facebookgo/ensure"
-	"github.com/facebookgo/freeport"
-	"github.com/facebookgo/httpcontrol"
+	"github.com/CrowdStrike/httpcontrol"
+	"github.com/onsi/gomega"
 )
 
 var theAnswer = []byte("42")
@@ -33,7 +31,7 @@ func errorHandler(timeout time.Duration) http.Handler {
 	return http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(timeout)
-			w.WriteHeader(500)
+			w.WriteHeader(http.StatusInternalServerError)
 			w.Write(theAnswer)
 		})
 }
@@ -145,7 +143,9 @@ func TestResponseHeaderTimeout(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(sleepHandler(5 * time.Second))
 	transport := &httpcontrol.Transport{
-		ResponseHeaderTimeout: 50 * time.Millisecond,
+		Transport: http.Transport{
+			ResponseHeaderTimeout: 50 * time.Millisecond,
+		},
 	}
 	transport.Stats = func(stats *httpcontrol.Stats) {
 		if stats.Error == nil {
@@ -186,19 +186,16 @@ func TestResponseTimeout(t *testing.T) {
 	if res != nil {
 		t.Fatal("was expecting nil response")
 	}
-	if !strings.Contains(err.Error(), "use of closed network connection") {
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("was expecting closed network connection related error, got %s", err)
 	}
 }
 
 func TestSafeRetry(t *testing.T) {
 	t.Parallel()
-	port, err := freeport.Get()
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	server := httptest.NewUnstartedServer(sleepHandler(time.Millisecond))
+	addr := server.Listener.Addr().String()
+	_ = server.Listener.Close()
 	transport := &httpcontrol.Transport{
 		MaxTries: 2,
 	}
@@ -213,6 +210,7 @@ func TestSafeRetry(t *testing.T) {
 			if !stats.Retry.Pending {
 				t.Fatal("was expecting pending retry", stats.Error)
 			}
+			var err error
 			server.Listener, err = net.Listen("tcp", addr)
 			if err != nil {
 				t.Fatal(err)
@@ -245,12 +243,9 @@ func TestSafeRetry(t *testing.T) {
 
 func TestSafeRetryAfterTimeout(t *testing.T) {
 	t.Parallel()
-	port, err := freeport.Get()
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	server := httptest.NewUnstartedServer(sleepHandler(5 * time.Second))
+	addr := server.Listener.Addr().String()
+	_ = server.Listener.Close()
 	transport := &httpcontrol.Transport{
 		MaxTries:          3,
 		RequestTimeout:    5 * time.Millisecond,
@@ -268,6 +263,7 @@ func TestSafeRetryAfterTimeout(t *testing.T) {
 			if !stats.Retry.Pending {
 				t.Fatal("was expecting pending retry", stats.Error)
 			}
+			var err error
 			server.Listener, err = net.Listen("tcp", addr)
 			if err != nil {
 				t.Fatal(err)
@@ -298,7 +294,7 @@ func TestSafeRetryAfterTimeout(t *testing.T) {
 		}
 	}
 	client := &http.Client{Transport: transport}
-	_, err = client.Get(fmt.Sprintf("http://%s/", addr))
+	_, err := client.Get(fmt.Sprintf("http://%s/", addr))
 
 	// Expect this to fail
 	if err == nil {
@@ -354,36 +350,36 @@ func TestRetryEOF(t *testing.T) {
 	}
 }
 
-var (
-	flagCount int
-	flagMutex sync.Mutex
-)
-
-func flagName() string {
-	flagMutex.Lock()
-	defer flagMutex.Unlock()
-	flagCount++
-	return fmt.Sprintf("testcontrol-%d", flagCount)
-}
-
-func TestFlag(t *testing.T) {
-	c := httpcontrol.TransportFlag(flagName())
-	if c == nil {
-		t.Fatal("did not get an instance")
+func TestCancelRequest(t *testing.T) {
+	gomega.RegisterTestingT(t)
+	t.Parallel()
+	server := httptest.NewServer(sleepHandler(5 * time.Second))
+	addr := server.Listener.Addr().String()
+	transport := &httpcontrol.Transport{
+		RequestTimeout: time.Hour,
 	}
+	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/", addr), nil)
+	client := &http.Client{Transport: transport}
+	time.AfterFunc(time.Millisecond, func() {
+		transport.CancelRequest(req)
+	})
+	_, err := client.Do(req)
+	gomega.Expect(err).ToNot(gomega.BeNil())
 }
 
 func TestStatsString(t *testing.T) {
+	gomega.RegisterTestingT(t)
+
 	s := httpcontrol.Stats{
 		Request: &http.Request{
-			Method: "GET",
+			Method: http.MethodGet,
 			URL:    &url.URL{Path: "/"},
 		},
 		Response: &http.Response{
 			Status: "200 OK",
 		},
 	}
-	ensure.DeepEqual(t, s.String(), "GET / got response with status 200 OK")
+	gomega.Expect(s.String()).To(gomega.Equal("GET / got response with status 200 OK"))
 }
 
 func TestCloseIdleConnections(t *testing.T) {

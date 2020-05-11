@@ -5,27 +5,28 @@ import (
 	"bytes"
 	"encoding/json"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"time"
 )
 
+// ByteCache is a key-value cache store
 type ByteCache interface {
 	Store(key string, value []byte, timeout time.Duration) error
 	Get(key string) ([]byte, error)
 }
 
+// Config provides cache key & timeout logic
 type Config interface {
-	// Generates the cache key for the given http.Request. An empty string will
-	// disable caching.
+	// Key is a function that generates the cache key for the given http.Request. An empty string will disable caching.
 	Key(req *http.Request) string
 
-	// Provides the max cache age for the given request/response pair. A zero
-	// value will disable caching for the pair. The request is available via
-	// res.Request.
+	// MaxAge provides the max cache age for the given request/response pair. A zero value will disable caching for the
+	// pair. The request is available via res.Request.
 	MaxAge(res *http.Response) time.Duration
 }
 
-// Cache enabled http.Transport.
+// Transport is a cache enabled http.Transport.
 type Transport struct {
 	Config    Config            // Provides cache key & timeout logic.
 	ByteCache ByteCache         // Cache where serialized responses will be stored.
@@ -37,14 +38,15 @@ type cacheEntry struct {
 	Body     []byte
 }
 
-// A cache enabled RoundTrip.
+// RoundTrip implements the RoundTripper interface.
 func (t *Transport) RoundTrip(req *http.Request) (res *http.Response, err error) {
 	key := t.Config.Key(req)
 	var entry cacheEntry
 
 	// from cache
 	if key != "" {
-		raw, err := t.ByteCache.Get(key)
+		var raw []byte
+		raw, err = t.ByteCache.Get(key)
 		if err != nil {
 			return nil, err
 		}
@@ -75,7 +77,9 @@ func (t *Transport) RoundTrip(req *http.Request) (res *http.Response, err error)
 
 	// fully buffer response for caching purposes
 	body, err := ioutil.ReadAll(res.Body)
-	res.Body.Close()
+	if closeErr := res.Body.Close(); closeErr != nil {
+		log.Printf("error closing body for %q: %v\n", res.Request.URL.String(), closeErr)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -111,37 +115,40 @@ func (t *Transport) RoundTrip(req *http.Request) (res *http.Response, err error)
 
 type cacheByPath time.Duration
 
+// Key returns the URL path (sans scheme and query params) to be used as the caching key
 func (c cacheByPath) Key(req *http.Request) string {
-	if req.Method != "GET" && req.Method != "HEAD" {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return ""
 	}
 	return req.URL.Host + "/" + req.URL.Path
 }
 
-func (c cacheByPath) MaxAge(res *http.Response) time.Duration {
+// MaxAge of a key is a preconfigured TTL
+func (c cacheByPath) MaxAge(_ *http.Response) time.Duration {
 	return time.Duration(c)
 }
 
-// This caches against the host + path (ignoring scheme, auth, query etc) for
-// the specified duration.
+// CacheByPath caches against the host + path (ignoring scheme, auth, query etc) for the specified duration.
 func CacheByPath(timeout time.Duration) Config {
 	return cacheByPath(timeout)
 }
 
 type cacheByURL time.Duration
 
+// Key returns the complete URL, to be used as the caching key
 func (c cacheByURL) Key(req *http.Request) string {
-	if req.Method != "GET" && req.Method != "HEAD" {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return ""
 	}
 	return req.URL.String()
 }
 
-func (c cacheByURL) MaxAge(res *http.Response) time.Duration {
+// MaxAge of a key is a preconfigured TTL
+func (c cacheByURL) MaxAge(_ *http.Response) time.Duration {
 	return time.Duration(c)
 }
 
-// This caches against the entire URL for the specified duration.
+// CacheByURL caches against the entire URL for the specified duration.
 func CacheByURL(timeout time.Duration) Config {
 	return cacheByURL(timeout)
 }
